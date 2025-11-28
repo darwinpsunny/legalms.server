@@ -33,6 +33,7 @@ const allowedOrigins = process.env.FRONTEND_URL
   ? process.env.FRONTEND_URL.split(',').map(url => url.trim())
   : [
       'http://localhost:4200',
+      'https://leegalms.vercel.app',
       'https://leegalms-o231gmx01-darwin-p-sunnys-projects.vercel.app',
       /^https:\/\/.*\.vercel\.app$/
     ];
