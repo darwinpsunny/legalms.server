@@ -3,13 +3,6 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 
-// Connection caching for serverless environments (Vercel)
-let cached = global.mongoose;
-
-if (!cached) {
-  cached = global.mongoose = { conn: null, promise: null };
-}
-
 // Load environment variables
 dotenv.config();
 
@@ -158,126 +151,250 @@ app.use((req, res) => {
   });
 });
 
-// Connect to MongoDB
+// ============================================================================
+// MongoDB Connection Configuration
+// ============================================================================
+
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/legalms';
-
-// MongoDB connection options for serverless environments
-// In serverless (Vercel), we disable buffering. In regular server, we can enable it.
 const isServerless = process.env.VERCEL === '1' || process.env.AWS_LAMBDA_FUNCTION_NAME;
+const isProduction = process.env.NODE_ENV === 'production';
 
-function getMongooseOptions() {
-  const options = {
-    serverSelectionTimeoutMS: 10000, // Timeout after 10s
-    socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
-    connectTimeoutMS: 10000, // Give up initial connection after 10s
-    maxPoolSize: isServerless ? 1 : 10, // Single connection in serverless
-    minPoolSize: 0, // No minimum pool in serverless
-    bufferCommands: !isServerless, // Disable buffering only in serverless environments
-    retryWrites: true, // Retry writes on network errors
-    retryReads: true, // Retry reads on network errors
+// Connection cache for serverless environments (Vercel)
+let connectionCache = global.mongoose;
+if (!connectionCache) {
+  connectionCache = global.mongoose = { conn: null, promise: null };
+}
+
+/**
+ * Get MongoDB connection options based on environment
+ */
+function getConnectionOptions() {
+  const baseOptions = {
+    serverSelectionTimeoutMS: 10000,
+    socketTimeoutMS: 45000,
+    connectTimeoutMS: 10000,
+    retryWrites: true,
+    retryReads: true,
   };
+
+  // Serverless-specific options
+  if (isServerless) {
+    return {
+      ...baseOptions,
+      maxPoolSize: 1,
+      minPoolSize: 0,
+      bufferCommands: false, // Critical for serverless
+    };
+  }
+
+  // Regular server options
+  return {
+    ...baseOptions,
+    maxPoolSize: 10,
+    minPoolSize: 1,
+    bufferCommands: true,
+  };
+}
+
+/**
+ * Setup MongoDB connection event handlers
+ */
+function setupConnectionHandlers() {
+  mongoose.connection.on('connected', () => {
+    console.log('✓ MongoDB connected');
+  });
+
+  mongoose.connection.on('error', (err) => {
+    console.error('✗ MongoDB connection error:', err.message);
+  });
+
+  mongoose.connection.on('disconnected', () => {
+    console.log('⚠ MongoDB disconnected');
+  });
+
+  mongoose.connection.on('reconnected', () => {
+    console.log('✓ MongoDB reconnected');
+  });
+}
+
+/**
+ * Validate MongoDB connection string
+ */
+function validateConnectionString() {
+  if (!MONGODB_URI || MONGODB_URI === 'mongodb://localhost:27017/legalms') {
+    if (isProduction) {
+      console.warn('⚠ MONGODB_URI not set - using default (may not work in production)');
+    }
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Get helpful error message based on error type
+ */
+function getErrorMessage(error) {
+  const errorType = error.constructor.name;
+  const errorMessage = error.message;
+
+  if (errorMessage.includes('timeout') || errorType === 'MongoNetworkTimeoutError') {
+    return {
+      title: 'Connection Timeout',
+      suggestions: [
+        'MongoDB Atlas Network Access: Whitelist Vercel IPs (or use 0.0.0.0/0 for testing)',
+        'Verify MONGODB_URI environment variable is correct',
+        'Check MongoDB Atlas cluster status',
+        'Ensure network firewall allows connections',
+      ],
+    };
+  }
+
+  if (errorMessage.includes('authentication') || errorType === 'MongoAuthenticationError') {
+    return {
+      title: 'Authentication Failed',
+      suggestions: [
+        'Verify username and password in connection string',
+        'Check database user permissions in MongoDB Atlas',
+        'Ensure user has access to the specified database',
+      ],
+    };
+  }
+
+  if (errorMessage.includes('ENOTFOUND') || errorMessage.includes('DNS')) {
+    return {
+      title: 'DNS Resolution Failed',
+      suggestions: [
+        'Check MongoDB connection string format',
+        'Verify cluster hostname is correct',
+        'Ensure network connectivity',
+      ],
+    };
+  }
+
+  return {
+    title: 'Connection Error',
+    suggestions: [
+      'Check MongoDB connection string',
+      'Verify network connectivity',
+      'Review MongoDB Atlas logs',
+    ],
+  };
+}
+
+/**
+ * Connect to MongoDB with caching for serverless environments
+ */
+async function connectToDatabase() {
+  // Return cached connection if available and connected
+  if (connectionCache.conn && mongoose.connection.readyState === 1) {
+    return connectionCache.conn;
+  }
+
+  // If connection is in progress, wait for it
+  if (connectionCache.promise) {
+    try {
+      connectionCache.conn = await connectionCache.promise;
+      return connectionCache.conn;
+    } catch (error) {
+      connectionCache.promise = null;
+      throw error;
+    }
+  }
+
+  // Validate connection string
+  const isValid = validateConnectionString();
+  if (!isValid && isProduction) {
+    throw new Error('MONGODB_URI environment variable is required in production');
+  }
+
+  // Get connection options
+  const options = getConnectionOptions();
   
-  // For MongoDB Atlas (SRV), ensure TLS is enabled
-  if (MONGODB_URI && MONGODB_URI.includes('mongodb+srv://')) {
+  // Add TLS options for Atlas SRV connections
+  if (MONGODB_URI.includes('mongodb+srv://')) {
     options.tls = true;
     options.tlsAllowInvalidCertificates = false;
   }
-  
-  return options;
-}
 
-async function connectDB() {
-  if (cached.conn && mongoose.connection.readyState === 1) {
-    return cached.conn;
-  }
+  // Log connection attempt
+  const connectionType = MONGODB_URI.includes('mongodb+srv://') ? 'Atlas (SRV)' : 'Standard';
+  console.log(`Connecting to MongoDB (${connectionType})...`);
 
-  if (!cached.promise) {
-    // Validate connection string
-    if (!MONGODB_URI || MONGODB_URI === 'mongodb://localhost:27017/legalms') {
-      console.warn('MongoDB URI not configured, using default (may not work in production)');
-    }
-    
-    const opts = getMongooseOptions();
-    
-    console.log('Attempting to connect to MongoDB...');
-    console.log('Connection string format:', MONGODB_URI.includes('mongodb+srv://') ? 'Atlas (SRV)' : 'Standard');
-    
-    cached.promise = mongoose.connect(MONGODB_URI, opts)
-      .then((mongoose) => {
-        console.log('✓ Connected to MongoDB successfully');
-        console.log('Database:', mongoose.connection.db?.databaseName || 'unknown');
-        return mongoose;
-      })
-      .catch((error) => {
-        console.error('✗ MongoDB connection failed');
-        console.error('Error type:', error.constructor.name);
-        console.error('Error message:', error.message);
-        
-        // Provide helpful error messages
-        if (error.message.includes('timeout')) {
-          console.error('\n⚠ Connection timeout. Possible causes:');
-          console.error('  1. MongoDB Atlas Network Access: Ensure Vercel IPs are whitelisted (or use 0.0.0.0/0 for testing)');
-          console.error('  2. Connection string: Verify MONGODB_URI is correct');
-          console.error('  3. Network: Check if MongoDB Atlas is accessible from Vercel');
-        } else if (error.message.includes('authentication')) {
-          console.error('\n⚠ Authentication failed. Check:');
-          console.error('  1. Username and password in connection string');
-          console.error('  2. Database user permissions');
-        }
-        
-        cached.promise = null;
-        throw error;
-      });
-  }
-  
+  // Create connection promise
+  connectionCache.promise = mongoose
+    .connect(MONGODB_URI, options)
+    .then((mongooseInstance) => {
+      const dbName = mongooseInstance.connection.db?.databaseName || 'unknown';
+      console.log(`✓ Connected to MongoDB: ${dbName}`);
+      connectionCache.conn = mongooseInstance;
+      return mongooseInstance;
+    })
+    .catch((error) => {
+      connectionCache.promise = null;
+      
+      // Log detailed error information
+      const errorInfo = getErrorMessage(error);
+      console.error(`✗ MongoDB connection failed: ${errorInfo.title}`);
+      console.error(`Error: ${error.message}`);
+      
+      if (isProduction) {
+        console.error('\nTroubleshooting suggestions:');
+        errorInfo.suggestions.forEach((suggestion, index) => {
+          console.error(`  ${index + 1}. ${suggestion}`);
+        });
+      }
+      
+      throw error;
+    });
+
   try {
-    cached.conn = await cached.promise;
-  } catch (e) {
-    cached.promise = null;
-    throw e;
+    connectionCache.conn = await connectionCache.promise;
+    return connectionCache.conn;
+  } catch (error) {
+    connectionCache.promise = null;
+    throw error;
   }
-
-  return cached.conn;
 }
 
-// Handle connection events
-mongoose.connection.on('error', (err) => {
-  console.error('MongoDB connection error:', err);
-});
-
-mongoose.connection.on('disconnected', () => {
-  console.log('MongoDB disconnected');
-});
-
-mongoose.connection.on('reconnected', () => {
-  console.log('MongoDB reconnected');
-});
-
-// Connect to database and start server
-connectDB()
-  .then(() => {
-    // Start server
+/**
+ * Initialize database connection and start server
+ */
+async function initializeServer() {
+  try {
+    // Setup connection event handlers
+    setupConnectionHandlers();
+    
+    // Connect to database
+    await connectToDatabase();
+    
+    // Start Express server
     const PORT = process.env.PORT || 5000;
     app.listen(PORT, () => {
-      console.log(`Server is running on port ${PORT}`);
-      console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`✓ Server running on port ${PORT}`);
+      console.log(`  Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`  Serverless: ${isServerless ? 'Yes' : 'No'}`);
     });
-  })
-  .catch((error) => {
-    console.error('MongoDB connection error:', error);
-    console.error('MongoDB URI:', MONGODB_URI ? 'Set' : 'NOT SET');
-    // Don't exit in serverless - let it retry
-    if (process.env.NODE_ENV === 'production') {
-      console.error('Continuing without database connection (serverless mode)');
-      // Still start the server in production to avoid deployment failures
+  } catch (error) {
+    console.error('Failed to initialize server:', error.message);
+    
+    // In production/serverless, start server anyway to avoid deployment failures
+    // Routes will handle database errors gracefully
+    if (isProduction || isServerless) {
+      console.warn('⚠ Starting server without database connection (serverless mode)');
       const PORT = process.env.PORT || 5000;
       app.listen(PORT, () => {
-        console.log(`Server is running on port ${PORT} (without database connection)`);
+        console.log(`⚠ Server running on port ${PORT} (database unavailable)`);
       });
     } else {
+      // In development, exit on connection failure
+      console.error('Exiting due to database connection failure');
       process.exit(1);
     }
-  });
+  }
+}
+
+// Initialize server
+initializeServer();
 
 module.exports = app;
 
