@@ -122,6 +122,60 @@ app.get('/api/status', (req, res) => {
   res.status(httpStatus).json(status);
 });
 
+// Database connection middleware - ensures connection is ready before processing API requests
+app.use('/api', async (req, res, next) => {
+  // Skip database check for health/status endpoints
+  if (req.path === '/health' || req.path === '/status') {
+    return next();
+  }
+
+  // Fast path: if already connected, proceed immediately
+  if (mongoose.connection.readyState === 1) {
+    return next();
+  }
+
+  // If disconnected, try to connect
+  if (mongoose.connection.readyState === 0) {
+    try {
+      await connectToDatabase();
+      return next();
+    } catch (error) {
+      return res.status(503).json({
+        success: false,
+        message: 'Database connection unavailable',
+        error: 'Service temporarily unavailable. Please try again in a moment.',
+      });
+    }
+  }
+
+  // If connecting, wait briefly (max 2 seconds)
+  if (mongoose.connection.readyState === 2) {
+    const maxWait = 2000;
+    const start = Date.now();
+    
+    while (mongoose.connection.readyState === 2 && (Date.now() - start) < maxWait) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    if (mongoose.connection.readyState === 1) {
+      return next();
+    }
+
+    return res.status(503).json({
+      success: false,
+      message: 'Database connection timeout',
+      error: 'Service temporarily unavailable. Please try again in a moment.',
+    });
+  }
+
+  // If disconnecting or unknown state, return error
+  return res.status(503).json({
+    success: false,
+    message: 'Database connection unavailable',
+    error: 'Service temporarily unavailable',
+  });
+});
+
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
