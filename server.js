@@ -91,6 +91,48 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Database connection check middleware
+app.use(async (req, res, next) => {
+  // Skip database check for health/status endpoints
+  if (req.path === '/api/health' || req.path === '/api/status') {
+    return next();
+  }
+  
+  // Ensure database connection is ready
+  if (mongoose.connection.readyState !== 1) {
+    // Try to connect if not already connecting
+    if (mongoose.connection.readyState === 0) {
+      try {
+        await connectDB();
+      } catch (error) {
+        console.error('Database connection failed in middleware:', error);
+        return res.status(503).json({
+          success: false,
+          message: 'Database connection unavailable',
+          error: 'Service temporarily unavailable'
+        });
+      }
+    } else if (mongoose.connection.readyState === 2) {
+      // Connection is in progress, wait a bit
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      if (mongoose.connection.readyState !== 1) {
+        return res.status(503).json({
+          success: false,
+          message: 'Database connection in progress',
+          error: 'Service temporarily unavailable'
+        });
+      }
+    } else {
+      return res.status(503).json({
+        success: false,
+        message: 'Database connection unavailable',
+        error: 'Service temporarily unavailable'
+      });
+    }
+  }
+  next();
+});
+
 // Request logging middleware
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.path}`);
@@ -172,13 +214,15 @@ app.use((req, res) => {
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/legalms';
 
 // MongoDB connection options for serverless environments
+// In serverless (Vercel), we disable buffering. In regular server, we can enable it.
+const isServerless = process.env.VERCEL === '1' || process.env.AWS_LAMBDA_FUNCTION_NAME;
 const mongooseOptions = {
   serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
   socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
   connectTimeoutMS: 10000, // Give up initial connection after 10s
   maxPoolSize: 10, // Maintain up to 10 socket connections
   minPoolSize: 1, // Maintain at least 1 socket connection
-  bufferCommands: false, // Disable mongoose buffering
+  bufferCommands: !isServerless, // Disable buffering only in serverless environments
 };
 
 async function connectDB() {
