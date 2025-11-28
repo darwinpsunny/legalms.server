@@ -3,6 +3,13 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 
+// Connection caching for serverless environments (Vercel)
+let cached = global.mongoose;
+
+if (!cached) {
+  cached = global.mongoose = { conn: null, promise: null };
+}
+
 // Load environment variables
 dotenv.config();
 
@@ -163,10 +170,59 @@ app.use((req, res) => {
 // Connect to MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/legalms';
 
-mongoose.connect(MONGODB_URI)
-  .then(() => {
-    console.log('Connected to MongoDB');
+// MongoDB connection options for serverless environments
+const mongooseOptions = {
+  serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of 30s
+  socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
+  connectTimeoutMS: 10000, // Give up initial connection after 10s
+  maxPoolSize: 10, // Maintain up to 10 socket connections
+  minPoolSize: 1, // Maintain at least 1 socket connection
+  bufferCommands: false, // Disable mongoose buffering
+};
+
+async function connectDB() {
+  if (cached.conn) {
+    return cached.conn;
+  }
+
+  if (!cached.promise) {
+    const opts = {
+      ...mongooseOptions,
+    };
     
+    cached.promise = mongoose.connect(MONGODB_URI, opts).then((mongoose) => {
+      console.log('Connected to MongoDB');
+      console.log('MongoDB URI:', MONGODB_URI ? 'Set' : 'NOT SET');
+      return mongoose;
+    });
+  }
+  
+  try {
+    cached.conn = await cached.promise;
+  } catch (e) {
+    cached.promise = null;
+    throw e;
+  }
+
+  return cached.conn;
+}
+
+// Handle connection events
+mongoose.connection.on('error', (err) => {
+  console.error('MongoDB connection error:', err);
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('MongoDB disconnected');
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log('MongoDB reconnected');
+});
+
+// Connect to database and start server
+connectDB()
+  .then(() => {
     // Start server
     const PORT = process.env.PORT || 5000;
     app.listen(PORT, () => {
@@ -176,7 +232,18 @@ mongoose.connect(MONGODB_URI)
   })
   .catch((error) => {
     console.error('MongoDB connection error:', error);
-    process.exit(1);
+    console.error('MongoDB URI:', MONGODB_URI ? 'Set' : 'NOT SET');
+    // Don't exit in serverless - let it retry
+    if (process.env.NODE_ENV === 'production') {
+      console.error('Continuing without database connection (serverless mode)');
+      // Still start the server in production to avoid deployment failures
+      const PORT = process.env.PORT || 5000;
+      app.listen(PORT, () => {
+        console.log(`Server is running on port ${PORT} (without database connection)`);
+      });
+    } else {
+      process.exit(1);
+    }
   });
 
 module.exports = app;
