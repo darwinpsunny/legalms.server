@@ -164,29 +164,70 @@ const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/legalm
 // MongoDB connection options for serverless environments
 // In serverless (Vercel), we disable buffering. In regular server, we can enable it.
 const isServerless = process.env.VERCEL === '1' || process.env.AWS_LAMBDA_FUNCTION_NAME;
-const mongooseOptions = {
-  serverSelectionTimeoutMS: 5000, // Timeout after 5s
-  socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
-  connectTimeoutMS: 10000, // Give up initial connection after 10s
-  maxPoolSize: isServerless ? 1 : 10, // Single connection in serverless
-  minPoolSize: 0, // No minimum pool in serverless
-  bufferCommands: !isServerless, // Disable buffering only in serverless environments
-};
+
+function getMongooseOptions() {
+  const options = {
+    serverSelectionTimeoutMS: 10000, // Timeout after 10s
+    socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
+    connectTimeoutMS: 10000, // Give up initial connection after 10s
+    maxPoolSize: isServerless ? 1 : 10, // Single connection in serverless
+    minPoolSize: 0, // No minimum pool in serverless
+    bufferCommands: !isServerless, // Disable buffering only in serverless environments
+    retryWrites: true, // Retry writes on network errors
+    retryReads: true, // Retry reads on network errors
+  };
+  
+  // For MongoDB Atlas (SRV), ensure TLS is enabled
+  if (MONGODB_URI && MONGODB_URI.includes('mongodb+srv://')) {
+    options.tls = true;
+    options.tlsAllowInvalidCertificates = false;
+  }
+  
+  return options;
+}
 
 async function connectDB() {
-  if (cached.conn) {
+  if (cached.conn && mongoose.connection.readyState === 1) {
     return cached.conn;
   }
 
   if (!cached.promise) {
-    const opts = {
-      ...mongooseOptions,
-    };
+    // Validate connection string
+    if (!MONGODB_URI || MONGODB_URI === 'mongodb://localhost:27017/legalms') {
+      console.warn('MongoDB URI not configured, using default (may not work in production)');
+    }
     
-    cached.promise = mongoose.connect(MONGODB_URI, opts).then((mongoose) => {
-      console.log('Connected to MongoDB');
-      return mongoose;
-    });
+    const opts = getMongooseOptions();
+    
+    console.log('Attempting to connect to MongoDB...');
+    console.log('Connection string format:', MONGODB_URI.includes('mongodb+srv://') ? 'Atlas (SRV)' : 'Standard');
+    
+    cached.promise = mongoose.connect(MONGODB_URI, opts)
+      .then((mongoose) => {
+        console.log('✓ Connected to MongoDB successfully');
+        console.log('Database:', mongoose.connection.db?.databaseName || 'unknown');
+        return mongoose;
+      })
+      .catch((error) => {
+        console.error('✗ MongoDB connection failed');
+        console.error('Error type:', error.constructor.name);
+        console.error('Error message:', error.message);
+        
+        // Provide helpful error messages
+        if (error.message.includes('timeout')) {
+          console.error('\n⚠ Connection timeout. Possible causes:');
+          console.error('  1. MongoDB Atlas Network Access: Ensure Vercel IPs are whitelisted (or use 0.0.0.0/0 for testing)');
+          console.error('  2. Connection string: Verify MONGODB_URI is correct');
+          console.error('  3. Network: Check if MongoDB Atlas is accessible from Vercel');
+        } else if (error.message.includes('authentication')) {
+          console.error('\n⚠ Authentication failed. Check:');
+          console.error('  1. Username and password in connection string');
+          console.error('  2. Database user permissions');
+        }
+        
+        cached.promise = null;
+        throw error;
+      });
   }
   
   try {
