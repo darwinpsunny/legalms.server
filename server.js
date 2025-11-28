@@ -84,58 +84,6 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Database connection check middleware (optimized for serverless)
-app.use(async (req, res, next) => {
-  // Skip database check for health/status endpoints
-  if (req.path === '/api/health' || req.path === '/api/status') {
-    return next();
-  }
-  
-  // Quick check - if already connected, proceed immediately
-  if (mongoose.connection.readyState === 1) {
-    return next();
-  }
-  
-  // Only attempt connection if disconnected (not if connecting/disconnecting)
-  if (mongoose.connection.readyState === 0) {
-    try {
-      // Use Promise.race to avoid long waits
-      await Promise.race([
-        connectDB(),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Connection timeout')), 2000)
-        )
-      ]);
-    } catch (error) {
-      // Only log in development, fail fast in production
-      if (process.env.NODE_ENV === 'development') {
-        console.error('Database connection failed in middleware:', error);
-      }
-      return res.status(503).json({
-        success: false,
-        message: 'Database connection unavailable',
-        error: 'Service temporarily unavailable'
-      });
-    }
-  } else if (mongoose.connection.readyState === 2) {
-    // Connection in progress - wait max 500ms
-    const maxWait = 500;
-    const start = Date.now();
-    while (mongoose.connection.readyState === 2 && (Date.now() - start) < maxWait) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    if (mongoose.connection.readyState !== 1) {
-      return res.status(503).json({
-        success: false,
-        message: 'Database connection timeout',
-        error: 'Service temporarily unavailable'
-      });
-    }
-  }
-  
-  next();
-});
-
 // Request logging middleware (reduced in production)
 app.use((req, res, next) => {
   if (process.env.NODE_ENV === 'development') {
@@ -213,50 +161,33 @@ app.use((req, res) => {
 // Connect to MongoDB
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/legalms';
 
-// MongoDB connection options optimized for serverless (Vercel)
+// MongoDB connection options for serverless environments
 // In serverless (Vercel), we disable buffering. In regular server, we can enable it.
 const isServerless = process.env.VERCEL === '1' || process.env.AWS_LAMBDA_FUNCTION_NAME;
 const mongooseOptions = {
-  serverSelectionTimeoutMS: 2000, // Faster timeout for serverless (2s instead of 5s)
+  serverSelectionTimeoutMS: 5000, // Timeout after 5s
   socketTimeoutMS: 45000, // Close sockets after 45s of inactivity
-  connectTimeoutMS: 3000, // Faster connection timeout (3s instead of 10s)
-  maxPoolSize: isServerless ? 1 : 10, // Single connection in serverless (better for cold starts)
+  connectTimeoutMS: 10000, // Give up initial connection after 10s
+  maxPoolSize: isServerless ? 1 : 10, // Single connection in serverless
   minPoolSize: 0, // No minimum pool in serverless
   bufferCommands: !isServerless, // Disable buffering only in serverless environments
-  maxIdleTimeMS: 30000, // Close idle connections after 30s
 };
 
 async function connectDB() {
-  // Return cached connection immediately if available
-  if (cached.conn && mongoose.connection.readyState === 1) {
+  if (cached.conn) {
     return cached.conn;
   }
 
-  // If connection is already in progress, wait for it
-  if (cached.promise) {
-    try {
-      cached.conn = await cached.promise;
-      return cached.conn;
-    } catch (e) {
-      cached.promise = null;
-      throw e;
-    }
-  }
-
-  // Start new connection
-  const opts = {
-    ...mongooseOptions,
-  };
-  
-  cached.promise = mongoose.connect(MONGODB_URI, opts).then((mongoose) => {
-    if (process.env.NODE_ENV === 'development') {
+  if (!cached.promise) {
+    const opts = {
+      ...mongooseOptions,
+    };
+    
+    cached.promise = mongoose.connect(MONGODB_URI, opts).then((mongoose) => {
       console.log('Connected to MongoDB');
-    }
-    return mongoose;
-  }).catch((error) => {
-    cached.promise = null;
-    throw error;
-  });
+      return mongoose;
+    });
+  }
   
   try {
     cached.conn = await cached.promise;
